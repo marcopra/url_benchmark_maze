@@ -21,7 +21,7 @@ num_seed_frames: 4000
 eval_every_frames: 10000
 num_eval_episodes: 10
 # snapshot
-snapshots: [100000, 500000, 1000000, 2000000]
+snapshots: [5000, 100000, 500000, 1000000, 2000000]
 snapshot_dir: ../../../models/${obs_type}/${domain}/${agent.name}/${seed}
 # replay buffer
 replay_buffer_size: 1000000
@@ -36,6 +36,11 @@ save_video: true
 save_train_video: false
 use_tb: false
 use_wandb: false
+wandb_project: "pretrain_gym"
+wandb_entity: "urlb"
+wandb_tag: none
+wandb_run_name: ${now:%Y.%m.%d}_${now:%H%M}_cdmc_${task_name}
+wandb_id: none # needed for resuming runs
 # experiment
 experiment: exp
 
