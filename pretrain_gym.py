@@ -121,6 +121,8 @@ class Workspace:
             self.work_dir if cfg.save_train_video else None,
             camera_id=0 if 'quadruped' not in self.cfg.domain else 2,
             use_wandb=self.cfg.use_wandb)
+        
+        self.snapshot_steps = cfg.snapshots
 
         self.timer = utils.Timer()
         self._global_step = 0
@@ -211,8 +213,8 @@ class Workspace:
                 self.replay_storage.add(time_step, meta)
                 self.train_video_recorder.init(time_step.observation)
                 # try to save snapshot
-                if self.global_frame in self.cfg.snapshots:
-                    self.save_snapshot()
+                self.save_snapshot()
+
                 episode_step = 0
                 episode_reward = 0
 
@@ -246,7 +248,12 @@ class Workspace:
     def save_snapshot(self):
         snapshot_dir = self.work_dir / Path(self.cfg.snapshot_dir)
         snapshot_dir.mkdir(exist_ok=True, parents=True)
-        snapshot = snapshot_dir / f'snapshot_{self.global_frame}.pt'
+        if self.global_frame >= self.snapshot_steps[0]:
+            snapshot = snapshot_dir / f'snapshot_{self.global_frame}.pt'
+            self.snapshot_steps.pop(0)
+            print(f'saving snapshot to {snapshot} at frame {self.global_frame}')
+        else:
+            snapshot = snapshot_dir / 'snapshot.pt'
         keys_to_save = ['agent', '_global_step', '_global_episode']
         payload = {k: self.__dict__[k] for k in keys_to_save}
         with snapshot.open('wb') as f:
