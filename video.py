@@ -60,6 +60,7 @@ class TrainVideoRecorder:
                  render_size=256,
                  fps=20,
                  camera_id=0,
+                 is_training_sample=True,
                  use_wandb=False):
         if root_dir is not None:
             self.save_dir = root_dir / 'train_video'
@@ -72,6 +73,7 @@ class TrainVideoRecorder:
         self.frames = []
         self.camera_id = camera_id
         self.use_wandb = use_wandb
+        self.is_training_sample = is_training_sample
 
     def init(self, obs, enabled=True):
         self.frames = []
@@ -80,9 +82,12 @@ class TrainVideoRecorder:
 
     def record(self, obs):
         if self.enabled:
-            frame = cv2.resize(obs[-3:].transpose(1, 2, 0),
-                               dsize=(self.render_size, self.render_size),
-                               interpolation=cv2.INTER_CUBIC)
+            if self.is_training_sample:
+                frame = cv2.resize(obs[-3:].transpose(1, 2, 0),
+                                dsize=(self.render_size, self.render_size),
+                                interpolation=cv2.INTER_CUBIC)
+            else:
+                frame = obs
             self.frames.append(frame)
 
     def log_to_wandb(self):

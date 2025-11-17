@@ -30,18 +30,8 @@ from dmc_benchmark import PRIMAL_TASKS
 
 def make_agent(obs_type, obs_spec, action_spec, num_expl_steps, cfg):
     cfg.obs_type = obs_type
-    cfg.obs_shape = obs_spec.shape if obs_spec.shape else (1,)
-    
-    # Determine mode based on action spec
-    if hasattr(action_spec, 'num_values'):
-        # Discrete action space
-        cfg.action_shape = (action_spec.num_values,)
-        cfg.mode = 'discrete'
-    else:
-        # Continuous action space
-        cfg.action_shape = action_spec.shape
-        cfg.mode = 'continuous'
-    
+    cfg.obs_shape = obs_spec.shape
+    cfg.action_shape = action_spec.shape
     cfg.num_expl_steps = num_expl_steps
     return hydra.utils.instantiate(cfg)
 
@@ -86,16 +76,15 @@ class Workspace:
             env_kwargs = gym_env.make_kwargs(cfg)
         else:
             env_kwargs = {}
-        self.train_env = gym_env.make(self.cfg.task_name, self.cfg.obs_type, self.cfg.frame_stack,
-                                self.cfg.action_repeat, self.cfg.seed, self.cfg.resolution, self.cfg.random_init, self.cfg.random_goal, url=True, **env_kwargs)
-        self.eval_env = gym_env.make(self.cfg.task_name, self.cfg.obs_type, self.cfg.frame_stack,
-                                self.cfg.action_repeat, self.cfg.seed, self.cfg.resolution, self.cfg.random_init, self.cfg.random_goal, url=True, **env_kwargs)
-       
+        self.train_env = gym_env.make(self.cfg.task_name, self.cfg.frame_stack,
+                                self.cfg.action_repeat, self.cfg.seed, self.cfg.resolution, self.cfg.random_init, self.cfg.random_goal, **env_kwargs)
+        self.eval_env = gym_env.make(self.cfg.task_name, self.cfg.frame_stack,
+                                self.cfg.action_repeat, self.cfg.seed, self.cfg.resolution, self.cfg.random_init, self.cfg.random_goal, **env_kwargs)
 
         # Get observation and action specs for the agent
         obs_spec = gym_env.observation_spec(self.train_env)
         action_spec = gym_env.action_spec(self.train_env)
-
+        
         # create agent
         self.agent = make_agent(cfg.obs_type,
                                 obs_spec,
@@ -105,15 +94,15 @@ class Workspace:
 
         # get meta specs
         meta_specs = self.agent.get_meta_specs()
-        time_step = self.train_env.reset()
-    
 
+        sample_time_step = self.train_env.reset()
+        proprio_shape = sample_time_step.proprio_observation.shape
         # create replay buffer
         data_specs = (obs_spec,
                       action_spec,
                       specs.Array((1,), np.float32, 'reward'),
                       specs.Array((1,), np.float32, 'discount'),
-                      )
+                      specs.Array(proprio_shape, np.float32, 'proprio_observation'))
 
         # create data storage
         self.replay_storage = ReplayBufferStorage(data_specs, meta_specs,
@@ -135,8 +124,7 @@ class Workspace:
         self.train_video_recorder = TrainVideoRecorder(
             self.work_dir if cfg.save_train_video else None,
             camera_id=0 if 'quadruped' not in self.cfg.domain else 2,
-            use_wandb=self.cfg.use_wandb,
-            is_training_sample=False)
+            use_wandb=self.cfg.use_wandb)
         
         self.snapshot_steps = cfg.snapshots
 
@@ -202,7 +190,7 @@ class Workspace:
         time_step = self.train_env.reset()
         meta = self.agent.init_meta()
         self.replay_storage.add(time_step, meta)
-        self.train_video_recorder.init(time_step.image_observation)
+        self.train_video_recorder.init(time_step.observation)
         metrics = None
         while train_until_step(self.global_step):
             if time_step.last():
@@ -227,7 +215,7 @@ class Workspace:
                 time_step = self.train_env.reset()
                 meta = self.agent.init_meta()
                 self.replay_storage.add(time_step, meta)
-                self.train_video_recorder.init(time_step.image_observation)
+                self.train_video_recorder.init(time_step.observation)
                 # try to save snapshot
                 self.save_snapshot()
 
@@ -257,7 +245,7 @@ class Workspace:
             time_step = self.train_env.step(action)
             episode_reward += time_step.reward
             self.replay_storage.add(time_step, meta)
-            self.train_video_recorder.record(time_step.image_observation)
+            self.train_video_recorder.record(time_step.observation)
             episode_step += 1
             self._global_step += 1
 

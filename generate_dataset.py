@@ -117,7 +117,7 @@ def create_replay_buffer_storage(data_specs, meta_specs, output_dir):
     return SimpleStorage(data_specs, meta_specs, output_dir)
 
 
-def collect_episodes(env, agent, num_episodes, storage, video_recorder=None, device='cuda'):
+def collect_episodes(env, agent, num_episodes, storage, video_recorder=None, device='cuda', video_every_n=1):
     """Collect episodes using the trained agent."""
     print(f"Starting episode collection with device: {device}")
     
@@ -174,8 +174,9 @@ def collect_episodes(env, agent, num_episodes, storage, video_recorder=None, dev
         for key, value in meta.items():
             episode_data[key].append(value)
         
-        # Initialize video recorder if provided
-        if video_recorder:
+        # Initialize video recorder if provided and this episode should be recorded
+        should_record_video = video_recorder and (episode_idx % video_every_n == 0)
+        if should_record_video:
             video_recorder.init(env, enabled=True)
         
         episode_reward = 0
@@ -216,8 +217,8 @@ def collect_episodes(env, agent, num_episodes, storage, video_recorder=None, dev
             for key, value in meta.items():
                 episode_data[key].append(value)
             
-            # Record video frame
-            if video_recorder:
+            # Record video frame only if this episode should be recorded
+            if should_record_video:
                 video_recorder.record(env)
             
             episode_reward += time_step.reward
@@ -231,8 +232,8 @@ def collect_episodes(env, agent, num_episodes, storage, video_recorder=None, dev
         total_transitions += episode_length
         episode_rewards.append(episode_reward)
         
-        # Save video
-        if video_recorder:
+        # Save video only if this episode was recorded
+        if should_record_video:
             video_recorder.save(f'episode_{episode_idx}.mp4')
         
         print(f"Episode {episode_idx + 1} completed: {episode_length} transitions, reward: {episode_reward:.2f}")
@@ -256,23 +257,25 @@ def main():
                        help='Number of episodes to collect')
     parser.add_argument('--output_dir', type=str, default='./generated_dataset',
                        help='Directory to save the dataset')
-    parser.add_argument('--frame_stack', type=int, default=1,
+    parser.add_argument('--frame_stack', type=int, default=3,
                        help='Number of frames to stack')
-    parser.add_argument('--action_repeat', type=int, default=1,
+    parser.add_argument('--action_repeat', type=int, default=2,
                        help='Action repeat factor')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device to use for inference')
-    parser.add_argument('--resolution', type=int, default=224,
+    parser.add_argument('--resolution', type=int, default=84,
                        help='Image resolution')
-    parser.add_argument('--random_init', action='store_true', default=True,
+    parser.add_argument('--random_init', action='store_true', default=False,
                        help='Use random initial positions')
-    parser.add_argument('--randomize_goal', action='store_true', default=True,
+    parser.add_argument('--randomize_goal', action='store_true', default=False,
                        help='Use random goals')
     parser.add_argument('--save_video', action='store_true',
                        help='Save videos of episodes')
-    
+    parser.add_argument('--video_every_n', type=int, default=1000,
+                       help='Save video every n episodes (default: 1000)')
+
     args = parser.parse_args()
     
     # Set device
@@ -353,7 +356,8 @@ def main():
         num_episodes=args.num_episodes,
         storage=storage,
         video_recorder=video_recorder,
-        device=device
+        device=device,
+        video_every_n=args.video_every_n
     )
     
     # Save summary statistics

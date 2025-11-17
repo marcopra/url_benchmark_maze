@@ -3,6 +3,7 @@ from typing import Any, NamedTuple
 import os
 
 import gymnasium as gym
+from env.rooms import *
 import numpy as np
 from gymnasium import spaces
 import mujoco
@@ -48,6 +49,7 @@ class ExtendedTimeStep(NamedTuple):
     discount: Any
     observation: Any
     proprio_observation: Any
+    image_observation: Any
     action: Any
     success: Any = None
 
@@ -66,12 +68,47 @@ class ExtendedTimeStep(NamedTuple):
         else:
             return tuple.__getitem__(self, attr)
 
+class DiscreteObservationWrapper(gym.Wrapper):
+    """Wrapper that converts discrete observations to one-hot encoding."""
+    
+    def __init__(self, env):
+        super().__init__(env)
+        if isinstance(env.observation_space, spaces.Discrete):
+            self.n_states = env.observation_space.n
+            assert self.n_states < 256, "Number of discrete states must be less than 256 for uint8 one-hot encoding, otherwise change dtype here."
+            self.is_discrete = True
+            # Update observation space to one-hot
+            self.observation_space = spaces.Box(
+                low=0, high=1, shape=(self.n_states,), dtype=np.float32
+            )
+        else:
+            self.is_discrete = False
+    
+    def _obs_to_onehot(self, obs):
+        """Convert discrete observation to one-hot."""
+        if self.is_discrete:
+            onehot = np.zeros(self.n_states, dtype=np.float32)
+            onehot[obs] = 1.0
+            return onehot
+        return obs
+    
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return self._obs_to_onehot(obs), info
+    
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return self._obs_to_onehot(obs), reward, terminated, truncated, info
+    
+    def __getattr__(self, name):
+        return getattr(self.env, name)
 
 class ActionRepeatWrapper(gym.Wrapper):
-    def __init__(self, env, num_repeats, data_collection=False):
+    def __init__(self, env, num_repeats, obs_type='pixels', data_collection=False):
         super().__init__(env)
         self._num_repeats = num_repeats
         self.data_collection = data_collection
+        self.obs_type = obs_type
         self.obs_keys = None
 
     def _process_proprio_obs(self, obs):
@@ -121,8 +158,9 @@ class ActionRepeatWrapper(gym.Wrapper):
             step_type=step_type,
             reward=reward,
             discount=discount if not done else 0.0,
-            observation=image_obs,  # Use image observations
+            observation=image_obs if self.obs_type == 'pixels' else proprio_obs,  # Use image or proprioceptive observations
             proprio_observation=proprio_obs,
+            image_observation=image_obs,
             action=action,
             success=info['success'] if 'success' in info else terminated,
         )
@@ -136,9 +174,10 @@ class ActionRepeatWrapper(gym.Wrapper):
             step_type=StepType.FIRST,
             reward=0.0,
             discount=1.0,
-            observation=image_obs,  # Use image observations
+            observation=image_obs if self.obs_type == 'pixels' else proprio_obs,  # Use image or proprioceptive observations
             proprio_observation=proprio_obs,
-            action=np.zeros(self.env.action_space.shape, dtype=np.float32),
+            image_observation=image_obs,
+            action=np.zeros(self.env.action_space.shape, dtype=self.env.action_space.dtype),
             success=False
         )
     
@@ -167,6 +206,7 @@ class FrameStackWrapper(gym.Wrapper):
         # Get the shape from the observation
         if isinstance(obs.observation, np.ndarray):
             self.orig_obs_shape = obs.observation.shape
+            
         else:
             # Handle case where observation might be a different structure
             raise ValueError("Expected observation to be a numpy array")
@@ -179,6 +219,7 @@ class FrameStackWrapper(gym.Wrapper):
             shape=(channels, self.orig_obs_shape[0], self.orig_obs_shape[1]),
             dtype=np.uint8
         )
+        self.proprio_observation_space = env.observation_space
 
     def _transform_observation(self, time_step):
         assert len(self._frames) == self._num_frames
@@ -223,12 +264,15 @@ class ActionDTypeWrapper(gym.Wrapper):
     def __init__(self, env, dtype=np.float32):
         super().__init__(env)
         original_space = env.action_space
-        self.action_space = gym.spaces.Box(
-            low=original_space.low.astype(dtype),
-            high=original_space.high.astype(dtype),
-            shape=original_space.shape,
-            dtype=dtype
-        )
+        if not isinstance(original_space, gym.spaces.Box):
+            self.action_space = gym.spaces.Discrete(original_space.n)
+        else:
+            self.action_space = gym.spaces.Box(
+                low=original_space.low.astype(dtype),
+                high=original_space.high.astype(dtype),
+                shape=original_space.shape,
+                dtype=dtype
+            )
 
     def step(self, action):
         action = action.astype(self.env.action_space.dtype)
@@ -315,7 +359,21 @@ class PhysicsStateWrapper(gym.Wrapper):
         
         return PhysicsInterface(self)
 
-
+class IgnoreSuccessTerminationWrapper(gym.Wrapper):
+    """Wrapper che ignora la terminazione basata su 'success'."""
+    
+    def __init__(self, env):
+        super().__init__(env)
+    
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        # Ignora 'success' per la terminazione
+        return obs, reward, False, truncated, info
+    
+    def __getattr__(self, name):
+        """Forward other attributes to the wrapped environment."""
+        return getattr(self.env, name)
+    
 class RewardSpecWrapper(gym.Wrapper):
     """Wrapper che aggiunge le specifiche per reward e discount compatibili con CDMC."""
     
@@ -418,17 +476,22 @@ class ExtendedTimeStepWrapper(gym.Wrapper):
 def observation_spec(env):
     """Get observation spec of the environment for agent initialization."""
     shape = env.observation_space.shape
-    return specs.Array(shape, np.uint8, 'observation')
+    return specs.Array(shape, np.float32, 'observation')
 
 
 def action_spec(env):
     """Get action spec of the environment for agent initialization."""
-    shape = env.action_space.shape
-    min_action = env.action_space.low[0]
-    max_action = env.action_space.high[0]
-    return specs.BoundedArray(shape, np.float32, min_action, max_action, 'action')
+    if isinstance(env.action_space, spaces.Discrete):
+        # For discrete action space
+        return specs.DiscreteArray(env.action_space.n, name='action', dtype=env.action_space.dtype)
+    else:
+        # For continuous action space
+        shape = env.action_space.shape
+        min_action = env.action_space.low[0]
+        max_action = env.action_space.high[0]
+        return specs.BoundedArray(shape, np.float32, min_action, max_action, 'action')
 
-def make(name, frame_stack=1, action_repeat=1, seed=None, resolution=224, random_init=True, randomize_goal=True, enable_relabelling=False):
+def make(name, obs_type, frame_stack=1, action_repeat=1, seed=None, resolution=224, random_init=True, randomize_goal=True, enable_relabelling=False, url = False, **kwargs):
     """
     Create a Gymnasium environment with wrappers.
     
@@ -460,13 +523,19 @@ def make(name, frame_stack=1, action_repeat=1, seed=None, resolution=224, random
                 maze_map = MEDIUM_MAZE_FIXED_INIT_FIXED_GOAL
         else:
             raise ValueError("random_init and randomize_goal are only supported for 'PointMaze_Medium' environments")
-        env = gym.make(name, render_mode='rgb_array', maze_map=maze_map)
+        kwargs['maze_map'] = maze_map
+        env = gym.make(name, render_mode='rgb_array', **kwargs)
  
     else:
-        env = gym.make(name, render_mode='rgb_array')
+        env = gym.make(name, render_mode='rgb_array', **kwargs)
 
     if seed is not None:
         env.reset(seed=seed)
+
+    if obs_type == 'discrete_states':
+        env = DiscreteObservationWrapper(env)
+
+    env = IgnoreSuccessTerminationWrapper(env)
     
     # Add wrappers
     env = ResizeRendering(env, resolution=resolution)   
@@ -478,16 +547,38 @@ def make(name, frame_stack=1, action_repeat=1, seed=None, resolution=224, random
         env = PhysicsStateWrapper(env)
         env = RewardSpecWrapper(env)
     
-    env = ActionRepeatWrapper(env, action_repeat)
+    env = ActionRepeatWrapper(env, action_repeat, obs_type)
     
-    # Add frame stacking if requested
-    env = FrameStackWrapper(env, frame_stack)
+    if obs_type == 'pixels':
+        env = FrameStackWrapper(env, frame_stack)
     
     env = ExtendedTimeStepWrapper(env)
     
     return env
 
-
+def make_kwargs(cfg):
+    """Return default kwargs for make function."""
+    env_kwargs = {
+            'max_steps': cfg.env.max_steps,
+            'show_coordinates': cfg.env.show_coordinates,
+            'goal_position': tuple(cfg.env.goal_position) if cfg.env.goal_position else None,
+            'start_position': tuple(cfg.env.start_position) if cfg.env.start_position else None,
+        }
+    # Add environment-specific parameters
+    if "SingleRoom" in cfg.env.name:
+        env_kwargs['room_size'] = cfg.env.room_size
+    elif "TwoRooms" in cfg.env.name:
+        env_kwargs['room_size'] = cfg.env.room_size
+        env_kwargs['corridor_length'] = cfg.env.corridor_length
+        env_kwargs['corridor_y'] = cfg.env.corridor_y
+    elif "FourRooms" in cfg.env.name:
+        env_kwargs['room_size'] = cfg.env.room_size
+        env_kwargs['corridor_length'] = cfg.env.corridor_length
+        env_kwargs['corridor_positions'] = {
+            'horizontal': cfg.env.corridor_positions.horizontal,
+            'vertical': cfg.env.corridor_positions.vertical
+        }
+    return env_kwargs
 # Tests
 if __name__ == "__main__":
     import pathlib
