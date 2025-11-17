@@ -15,3 +15,8 @@ env:
   
   # Start position (optional, null for random at each episode)
   start_position:  [0, 0]  # Can be [x, y] or null for random
+
+frame_stack: 3 # only works if obs_type=pixels
+action_repeat: 1 # set to 2 for pixels
+random_init: false
+random_goal: false
