@@ -275,7 +275,8 @@ class ActionDTypeWrapper(gym.Wrapper):
             )
 
     def step(self, action):
-        action = action.astype(self.env.action_space.dtype)
+        if type(action) != int:
+            action = action.astype(self.env.action_space.dtype)
         return self.env.step(action)
     
     def __getattr__(self, name):
@@ -534,8 +535,9 @@ def make(name, obs_type, frame_stack=1, action_repeat=1, seed=None, resolution=2
 
     if obs_type == 'discrete_states':
         env = DiscreteObservationWrapper(env)
-
-    env = IgnoreSuccessTerminationWrapper(env)
+    
+    if url:
+        env = IgnoreSuccessTerminationWrapper(env)
     
     # Add wrappers
     env = ResizeRendering(env, resolution=resolution)   

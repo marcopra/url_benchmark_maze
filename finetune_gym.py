@@ -5,19 +5,17 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 import os
 
 os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
-if 'MUJOCO_GL' not in os.environ:
-    os.environ['MUJOCO_GL'] = 'osmesa'  # or whatever default you want
+os.environ['MUJOCO_GL'] = 'egl'
+
 from pathlib import Path
 
 import hydra
 from omegaconf import OmegaConf
 import numpy as np
 import torch
-import wandb
 from dm_env import specs
 import gym_env
-
-import dmc
+import wandb
 import utils
 from logger import Logger
 from replay_buffer import ReplayBufferStorage, make_replay_loader
@@ -25,13 +23,21 @@ from video import TrainVideoRecorder, VideoRecorder
 
 torch.backends.cudnn.benchmark = True
 
-from dmc_benchmark import PRIMAL_TASKS
-
 
 def make_agent(obs_type, obs_spec, action_spec, num_expl_steps, cfg):
     cfg.obs_type = obs_type
-    cfg.obs_shape = obs_spec.shape
-    cfg.action_shape = action_spec.shape
+    cfg.obs_shape = obs_spec.shape if obs_spec.shape else (1,)
+    
+    # Determine mode based on action spec
+    if hasattr(action_spec, 'num_values'):
+        # Discrete action space
+        cfg.action_shape = (action_spec.num_values,)
+        cfg.mode = 'discrete'
+    else:
+        # Continuous action space
+        cfg.action_shape = action_spec.shape
+        cfg.mode = 'continuous'
+    
     cfg.num_expl_steps = num_expl_steps
     return hydra.utils.instantiate(cfg)
 
@@ -46,6 +52,11 @@ class Workspace:
         self.device = torch.device(cfg.device)
 
         # create logger
+        self.logger = Logger(self.work_dir,
+                             use_tb=cfg.use_tb,
+                             use_wandb=cfg.use_wandb)
+        
+         # create logger
         if cfg.use_wandb:
             if cfg.wandb_id is not None and cfg.wandb_id != "none":
                 wandb.init(
@@ -67,24 +78,22 @@ class Workspace:
                 
             wandb.run.save()
 
-        self.logger = Logger(self.work_dir,
-                             use_tb=cfg.use_tb,
-                             use_wandb=cfg.use_wandb)
+
         # create envs
         task = cfg.task_name
         if hasattr(cfg, 'env'):
             env_kwargs = gym_env.make_kwargs(cfg)
         else:
             env_kwargs = {}
-        self.train_env = gym_env.make(self.cfg.task_name, self.cfg.frame_stack,
-                                self.cfg.action_repeat, self.cfg.seed, self.cfg.resolution, self.cfg.random_init, self.cfg.random_goal, **env_kwargs)
-        self.eval_env = gym_env.make(self.cfg.task_name, self.cfg.frame_stack,
-                                self.cfg.action_repeat, self.cfg.seed, self.cfg.resolution, self.cfg.random_init, self.cfg.random_goal, **env_kwargs)
-
+        self.train_env = gym_env.make(self.cfg.task_name, self.cfg.obs_type, self.cfg.frame_stack,
+                                self.cfg.action_repeat, self.cfg.seed, self.cfg.resolution, self.cfg.random_init, self.cfg.random_goal, url=False, **env_kwargs)
+        self.eval_env = gym_env.make(self.cfg.task_name, self.cfg.obs_type, self.cfg.frame_stack,
+                                self.cfg.action_repeat, self.cfg.seed, self.cfg.resolution, self.cfg.random_init, self.cfg.random_goal, url=False, **env_kwargs)
+       
         # Get observation and action specs for the agent
         obs_spec = gym_env.observation_spec(self.train_env)
         action_spec = gym_env.action_spec(self.train_env)
-        
+
         # create agent
         self.agent = make_agent(cfg.obs_type,
                                 obs_spec,
@@ -92,17 +101,18 @@ class Workspace:
                                 cfg.num_seed_frames // cfg.action_repeat,
                                 cfg.agent)
 
+        # initialize from pretrained
+        if cfg.snapshot_ts > 0:
+            pretrained_agent = self.load_snapshot()['agent']
+            self.agent.init_from(pretrained_agent)
+
         # get meta specs
         meta_specs = self.agent.get_meta_specs()
-
-        sample_time_step = self.train_env.reset()
-        proprio_shape = sample_time_step.proprio_observation.shape
         # create replay buffer
         data_specs = (obs_spec,
                       action_spec,
                       specs.Array((1,), np.float32, 'reward'),
-                      specs.Array((1,), np.float32, 'discount'),
-                      specs.Array(proprio_shape, np.float32, 'proprio_observation'))
+                      specs.Array((1,), np.float32, 'discount'))
 
         # create data storage
         self.replay_storage = ReplayBufferStorage(data_specs, meta_specs,
@@ -119,14 +129,11 @@ class Workspace:
         # create video recorders
         self.video_recorder = VideoRecorder(
             self.work_dir if cfg.save_video else None,
-            camera_id=0 if 'quadruped' not in self.cfg.domain else 2,
             use_wandb=self.cfg.use_wandb)
         self.train_video_recorder = TrainVideoRecorder(
             self.work_dir if cfg.save_train_video else None,
-            camera_id=0 if 'quadruped' not in self.cfg.domain else 2,
-            use_wandb=self.cfg.use_wandb)
-        
-        self.snapshot_steps = cfg.snapshots
+            use_wandb=self.cfg.use_wandb,
+            is_training_sample=False)
 
         self.timer = utils.Timer()
         self._global_step = 0
@@ -190,7 +197,7 @@ class Workspace:
         time_step = self.train_env.reset()
         meta = self.agent.init_meta()
         self.replay_storage.add(time_step, meta)
-        self.train_video_recorder.init(time_step.observation)
+        self.train_video_recorder.init(time_step.image_observation)
         metrics = None
         while train_until_step(self.global_step):
             if time_step.last():
@@ -215,9 +222,7 @@ class Workspace:
                 time_step = self.train_env.reset()
                 meta = self.agent.init_meta()
                 self.replay_storage.add(time_step, meta)
-                self.train_video_recorder.init(time_step.observation)
-                # try to save snapshot
-                self.save_snapshot()
+                self.train_video_recorder.init(time_step.image_observation)
 
                 episode_step = 0
                 episode_reward = 0
@@ -229,6 +234,16 @@ class Workspace:
                 self.eval()
 
             meta = self.agent.update_meta(meta, self.global_step, time_step)
+
+            if hasattr(self.agent, "regress_meta"):
+                repeat = self.cfg.action_repeat
+                every = self.agent.update_task_every_step // repeat
+                init_step = self.agent.num_init_steps
+                if self.global_step > (
+                        init_step // repeat) and self.global_step % every == 0:
+                    meta = self.agent.regress_meta(self.replay_iter,
+                                                   self.global_step)
+
             # sample action
             with torch.no_grad(), utils.eval_mode(self.agent):
                 action = self.agent.act(time_step.observation,
@@ -245,28 +260,42 @@ class Workspace:
             time_step = self.train_env.step(action)
             episode_reward += time_step.reward
             self.replay_storage.add(time_step, meta)
-            self.train_video_recorder.record(time_step.observation)
+            self.train_video_recorder.record(time_step.image_observation)
             episode_step += 1
             self._global_step += 1
 
-    def save_snapshot(self):
-        snapshot_dir = self.work_dir / Path(self.cfg.snapshot_dir)
-        snapshot_dir.mkdir(exist_ok=True, parents=True)
-        if self.global_frame >= self.snapshot_steps[0]:
-            snapshot = snapshot_dir / f'snapshot_{self.global_frame}.pt'
-            self.snapshot_steps.pop(0)
-            print(f'saving snapshot to {snapshot} at frame {self.global_frame}')
-        else:
-            snapshot = snapshot_dir / 'snapshot.pt'
-        keys_to_save = ['agent', '_global_step', '_global_episode']
-        payload = {k: self.__dict__[k] for k in keys_to_save}
-        with snapshot.open('wb') as f:
-            torch.save(payload, f)
+    def load_snapshot(self):
+        snapshot_base_dir = Path(self.cfg.snapshot_base_dir)
+        domain = self.cfg.domain
+        snapshot_dir = snapshot_base_dir / self.cfg.obs_type / domain / self.cfg.agent.name
+
+        def try_load(seed):
+            snapshot = snapshot_dir / str(
+                seed) / f'snapshot_{self.cfg.snapshot_ts}.pt'
+            
+            print(f'trying to load snapshot from absolute path: {os.path.abspath(snapshot)}')
+            if not snapshot.exists():
+                return None
+            with snapshot.open('rb') as f:
+                payload = torch.load(f)
+            return payload
+
+        # try to load current seed
+        payload = try_load(self.cfg.seed)
+        if payload is not None:
+            return payload
+        # otherwise try random seed
+        # while True:
+        #     seed = np.random.randint(1, 11)
+        #     payload = try_load(seed)
+        #     if payload is not None:
+        #         return payload
+        return None
 
 
-@hydra.main(config_path='.', config_name='pretrain_gym_rooms')
+@hydra.main(config_path='.', config_name='finetune_gym')
 def main(cfg):
-    from pretrain_gym import Workspace as W
+    from finetune_gym import Workspace as W
     root_dir = Path.cwd()
     workspace = W(cfg)
     snapshot = root_dir / 'snapshot.pt'
